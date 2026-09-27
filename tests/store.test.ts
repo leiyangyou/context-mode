@@ -7,12 +7,12 @@
 
 import { describe, test, expect } from "vitest";
 import { strict as assert } from "node:assert";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ContentStore, cleanupStaleDBs } from "../src/store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs } from "../src/store.js";
 import {
   withRetry,
   closeDB,
@@ -1160,6 +1160,59 @@ describe("DB Cleanup", () => {
 
     // Clean up manually
     try { require("fs").unlinkSync(myPath); } catch {}
+  });
+
+  test("cleanupStaleContentDBs does not reap a live-but-idle DB with a non-empty WAL (#880, #1024)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-content-idle-"));
+    const dbPath = join(dir, "proj-idle.db");
+    writeFileSync(dbPath, "db");
+    writeFileSync(dbPath + "-wal", Buffer.alloc(8192, 2));
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(dbPath, twoHoursAgo, twoHoursAgo);
+    utimesSync(dbPath + "-wal", twoHoursAgo, twoHoursAgo);
+
+    const cleaned = cleanupStaleContentDBs(dir, 14);
+
+    assert.equal(cleaned, 0, "idle-but-live DB must not be reaped");
+    assert.ok(existsSync(dbPath), "DB must survive");
+    assert.ok(existsSync(dbPath + "-wal"), "WAL must survive");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("cleanupStaleContentDBs still reaps DBs older than maxAgeDays", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-content-old-"));
+    const dbPath = join(dir, "proj-old.db");
+    writeFileSync(dbPath, "db");
+    writeFileSync(dbPath + "-wal", "wal");
+    writeFileSync(dbPath + "-shm", "shm");
+    const twentyDaysAgo = new Date(Date.now() - 20 * 24 * 3600_000);
+    for (const p of [dbPath, dbPath + "-wal", dbPath + "-shm"]) utimesSync(p, twentyDaysAgo, twentyDaysAgo);
+
+    const cleaned = cleanupStaleContentDBs(dir, 14);
+
+    assert.equal(cleaned, 1, "20-day-old DB should be reaped");
+    assert.ok(!existsSync(dbPath), "DB removed");
+    assert.ok(!existsSync(dbPath + "-wal"), "WAL removed");
+    assert.ok(!existsSync(dbPath + "-shm"), "SHM removed");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("cleanupStaleContentDBs never reaps the DB path passed as skipPath", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-content-skip-"));
+    const ownPath = join(dir, "own.db");
+    const otherPath = join(dir, "other.db");
+    writeFileSync(ownPath, "db");
+    writeFileSync(otherPath, "db");
+    const twentyDaysAgo = new Date(Date.now() - 20 * 24 * 3600_000);
+    utimesSync(ownPath, twentyDaysAgo, twentyDaysAgo);
+    utimesSync(otherPath, twentyDaysAgo, twentyDaysAgo);
+
+    const cleaned = cleanupStaleContentDBs(dir, 14, ownPath);
+
+    assert.equal(cleaned, 1, "only the neighbour is reaped");
+    assert.ok(existsSync(ownPath), "own DB must survive");
+    assert.ok(!existsSync(otherPath), "neighbour DB is still reaped");
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("store.cleanup() removes own DB and WAL/SHM files", () => {
