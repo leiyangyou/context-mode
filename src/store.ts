@@ -216,10 +216,18 @@ function isProcessAlive(pid: number): boolean {
 /**
  * Clean up stale per-project content store DBs older than maxAgeDays.
  * Scans the given directory for *.db files and checks mtime.
- * Also detects zombie processes holding WAL locks — if a WAL file exists
- * but the owning PID is dead, the DB files are cleaned up regardless of age.
+ *
+ * `skipPath` is the DB this process just opened — never unlink the store we are
+ * about to write to. The content DB is per project dir, not per process, so
+ * several servers hold the same file; unlinking it out from under them wedges
+ * every other holder (#880, #1024).
+ *
+ * A WAL file's age is NOT a liveness signal. In WAL mode an idle connection
+ * holds no lock, so a non-empty WAL that has not been touched for an hour
+ * belongs to a live-but-idle session at least as often as to a dead one.
+ * Age is the only safe trigger here: a zombie DB lingers until maxAgeDays.
  */
-export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
+export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number, skipPath?: string): number {
   let cleaned = 0;
   try {
     if (!existsSync(contentDir)) return 0;
@@ -228,25 +236,9 @@ export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): 
     for (const file of files) {
       try {
         const filePath = join(contentDir, file);
+        if (skipPath && filePath === skipPath) continue;
         const mtime = statSync(filePath).mtimeMs;
-        let shouldClean = mtime < cutoff;
-
-        // Detect zombie processes holding WAL locks:
-        // If a WAL file exists, try to read the WAL header to extract the PID.
-        // WAL files from dead processes can block new connections.
-        if (!shouldClean) {
-          const walPath = filePath + "-wal";
-          if (existsSync(walPath)) {
-            try {
-              const walStat = statSync(walPath);
-              // If WAL file is non-empty and DB hasn't been modified in >1 hour,
-              // the owning process may be dead — check via mtime staleness
-              if (walStat.size > 0 && (Date.now() - walStat.mtimeMs) > 3600_000) {
-                shouldClean = true;
-              }
-            } catch { /* ignore WAL check errors */ }
-          }
-        }
+        const shouldClean = mtime < cutoff;
 
         if (shouldClean) {
           for (const suffix of ["", "-wal", "-shm"]) {

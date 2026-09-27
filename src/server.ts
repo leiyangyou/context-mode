@@ -726,11 +726,11 @@ function getStore(): ContentStore {
     // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
       const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
+      cleanupStaleContentDBs(contentDir, 14, getStorePath());
       _store.cleanupStaleSources(14);
       // Also clean legacy shared dir from before platform isolation
       const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 14);
     } catch { /* best-effort */ }
 
     // Also clean old PID-based DBs from migration
