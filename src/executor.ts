@@ -10,6 +10,7 @@ import {
 } from "./runtime.js";
 export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
+import { requestAbortSignal } from "./lifecycle.js";
 
 const isWin = process.platform === "win32";
 
@@ -507,6 +508,16 @@ export class PolyglotExecutor {
         }
       }, timeout);
 
+      // Only this process holds the child handle, so the host aborting its
+      // signal has to kill the tree here.
+      const abortSignal = requestAbortSignal();
+      const onAbort = (): void => {
+        if (resolved) return;
+        killTree(proc);
+      };
+      if (abortSignal?.aborted) onAbort();
+      else abortSignal?.addEventListener("abort", onAbort, { once: true });
+
       // Stream-level byte cap: kill the process once combined stdout+stderr
       // exceeds hardCapBytes. Without this, a command like `yes` or
       // `cat /dev/urandom | base64` can accumulate gigabytes in memory
@@ -538,6 +549,7 @@ export class PolyglotExecutor {
 
       proc.on("close", (exitCode) => {
         clearTimeout(timer);
+        abortSignal?.removeEventListener("abort", onAbort);
         if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
@@ -559,6 +571,7 @@ export class PolyglotExecutor {
 
       proc.on("error", (err) => {
         clearTimeout(timer);
+        abortSignal?.removeEventListener("abort", onAbort);
         if (resolved) return; // Already resolved by background timeout
         res({
           stdout: "",

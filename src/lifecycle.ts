@@ -21,6 +21,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface LifecycleGuardOptions {
   /** Interval in ms to check parent liveness. Default: 30_000 */
@@ -195,6 +196,23 @@ export function noteRequestStart(): void {
 export function noteRequestEnd(): void {
   if (_inFlight > 0) _inFlight--;
   _lastMcpActivity = Date.now();
+}
+
+/**
+ * The abort signal of the tool call currently being handled, if the host
+ * supplies one. The MCP SDK aborts `extra.signal` when the client sends
+ * `notifications/cancelled` (pi sends it on Esc), and the executor reads it at
+ * spawn time so a cancelled request kills the child it started instead of
+ * leaving it running detached.
+ */
+const requestAbort = new AsyncLocalStorage<AbortSignal | undefined>();
+
+export function runWithRequestAbort<T>(signal: AbortSignal | undefined, fn: () => T): T {
+  return requestAbort.run(signal, fn);
+}
+
+export function requestAbortSignal(): AbortSignal | undefined {
+  return requestAbort.getStore();
 }
 
 /**

@@ -1,18 +1,7 @@
 import "../setup-home";
 /**
- * Pi MCP bridge — Esc must actually stop the work.
- *
- * Pi hands a custom tool an AbortSignal as the third argument of `execute()`
- * and aborts it on Esc (`interrupt`). The bridge ignored that signal, and the
- * executor's `tools/call` has no transport bound at all (the bridge passes
- * `Number.POSITIVE_INFINITY`, so no timer is armed), so Esc returned the turn
- * while the spawned child kept running as an orphan. The child is spawned
- * `detached: true` into its own process group, so nothing else can reap it —
- * only the executor that holds the handle can.
- *
- * The observable effect is the child's own side effect. The script writes a
- * "started" file immediately and a "finished" file 4 s later; if the abort
- * works the finished file never appears.
+ * Esc must stop a running ctx_execute. The script writes "started" at once and
+ * "finished" 4 s later, so a child that survives the abort leaves the second file.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -57,8 +46,6 @@ beforeAll(async () => {
   };
 
   handle = await bootstrapMCPTools(fakePi, SERVER_BUNDLE, {
-    // Pin the runtime the tests already run on; PATH may hold a shim that does
-    // not resolve under the fake HOME.
     _resolveJsRuntime: () => process.execPath,
   });
 }, 30_000);
@@ -67,12 +54,10 @@ afterAll(() => {
   try {
     handle?.shutdown();
   } catch {
-    /* best effort */
   }
   try {
     rmSync(scratch, { recursive: true, force: true });
   } catch {
-    /* best effort */
   }
 });
 
@@ -100,8 +85,6 @@ describe("pi bridge abort — Esc stops the running child", () => {
 
     ac.abort();
 
-    // Wait out the child's own timer, then read its effect. A surviving child
-    // writes the file; a killed one never does.
     await pollUntil(() => existsSync(finished), SLEEP_MS + 3_000);
     expect(existsSync(finished)).toBe(false);
 

@@ -552,6 +552,7 @@ export class MCPStdioClient {
     method: string,
     params: unknown,
     timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<T> {
     // Respawn-on-idle-exit (#583, #583-followup).
     //
@@ -578,29 +579,58 @@ export class MCPStdioClient {
     if (!this.child) throw new Error("MCP client not started");
     const id = ++this.requestId;
     return new Promise<T>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      // Unhandled, Esc returns the turn while the server runs the child to completion.
+      // The pending entry is deleted before notifying, so a call that was already
+      // aborted on entry (no entry yet, no frame written) rejects without telling
+      // the server to cancel an id it never issued.
+      const handleAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener("abort", handleAbort);
+        if (this.pending.delete(id)) {
+          this.notify("notifications/cancelled", { requestId: id, reason: "client aborted" });
+        }
+        reject(new Error(`MCP request aborted: ${method}`));
+      };
+      if (signal?.aborted) {
+        handleAbort();
+        return;
+      }
       // Gate the timer on a finite ms value so callers can pass
       // `Number.POSITIVE_INFINITY` to mean "no bridge ceiling" (#643).
       // Node coerces both `undefined` and `Infinity` to a 1ms delay
       // (TimeoutOverflowWarning), so we can't just pass them through —
       // we must skip the setTimeout entirely. tools/call uses this path
       // because long-running ctx_execute must not be bounded here.
-      const timer = Number.isFinite(timeoutMs)
-        ? setTimeout(() => {
-            if (!this.pending.has(id)) return;
-            this.pending.delete(id);
-            reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
-          }, timeoutMs)
-        : null;
+      if (Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener("abort", handleAbort);
+          this.pending.delete(id);
+          reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
+        }, timeoutMs);
+      }
       this.pending.set(id, {
         resolve: (v) => {
+          if (settled) return;
+          settled = true;
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", handleAbort);
           resolve(v as T);
         },
         reject: (e) => {
+          if (settled) return;
+          settled = true;
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", handleAbort);
           reject(e);
         },
       });
+      signal?.addEventListener("abort", handleAbort, { once: true });
       const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
       const rejectWrite = (err: Error) => {
         const handler = this.pending.get(id);
@@ -679,7 +709,7 @@ export class MCPStdioClient {
     return Array.isArray(result.tools) ? result.tools : [];
   }
 
-  async callTool(name: string, args: unknown): Promise<MCPCallResult> {
+  async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPCallResult> {
     // Respawn-on-idle-exit is now handled centrally in `request()`
     // (#583 follow-up). Originally patched here in #583 — moving it up
     // one layer covers `listTools` / `initialize` paths too, with a
@@ -697,6 +727,7 @@ export class MCPStdioClient {
       "tools/call",
       { name, arguments: args ?? {} },
       Number.POSITIVE_INFINITY,
+      signal,
     );
   }
 
@@ -784,6 +815,8 @@ export interface PiToolRegistration {
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
+    // Pi aborts this on Esc; the bridge forwards it so the server can cancel.
+    signal?: AbortSignal,
   ) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
@@ -1031,8 +1064,8 @@ export async function bootstrapMCPTools(
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
       renderCall: createContextModeCallRenderer(tool.name),
       renderResult: createContextModeResultRenderer(tool.name),
-      async execute(_toolCallId, params) {
-        const result = await client.callTool(tool.name, params ?? {});
+      async execute(_toolCallId, params, signal) {
+        const result = await client.callTool(tool.name, params ?? {}, signal);
         const text = (result.content ?? [])
           .filter((c) => c?.type === "text" && typeof c.text === "string")
           .map((c) => c.text as string)

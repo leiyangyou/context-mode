@@ -30,7 +30,7 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
+import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap, runWithRequestAbort } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
   describeStorageDirectorySource,
@@ -291,17 +291,20 @@ const originalRegisterTool = server.registerTool.bind(server);
   return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
 };
 
+type ToolCallExtra = { signal?: AbortSignal };
+
 function wrapToolHandler(
   name: string,
   handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-): (toolArgs: Record<string, unknown>) => Promise<unknown> {
-  return async (toolArgs: Record<string, unknown>) => {
+): (toolArgs: Record<string, unknown>, extra?: ToolCallExtra) => Promise<unknown> {
+  return async (toolArgs: Record<string, unknown>, extra?: ToolCallExtra) => {
     // #854: mark a tool call in-flight so the bridge-child idle reaper never
     // shuts the server down mid-execution during a long ctx_execute/batch that
     // emits no further inbound messages. Symmetric end in finally (success+error).
     noteRequestStart();
     try {
-      return await handler(toolArgs);
+      // The executor is a separate module; publish the signal it has to kill on.
+      return await runWithRequestAbort(extra?.signal, () => handler(toolArgs));
     } catch (err) {
       const result = storageErrorResult(err);
       if (result) {
